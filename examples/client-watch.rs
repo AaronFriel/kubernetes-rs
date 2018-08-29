@@ -1,93 +1,207 @@
-extern crate futures;
-extern crate hyper;
-extern crate hyper_tls;
-extern crate serde_json;
-extern crate failure;
-extern crate kubernetes;
-#[macro_use] extern crate log;
-extern crate pretty_env_logger;
+#![feature(uniform_paths)]
+#![feature(try_blocks, try_trait, type_ascription)]
 
-use std::result::Result;
-use failure::Error;
-use futures::prelude::*;
+use failure::{Error, Fail};
+use futures::{prelude::*, stream::Stream};
 use hyper::rt;
+use k8s_openapi::v1_11::{
+    api::core::v1::*,
+    apimachinery::pkg::{apis::meta::v1::*, runtime::*},
+};
+use log::{error, info};
+use std::{option::NoneError, result::Result};
 
-use kubernetes::api;
-use kubernetes::client::{Client,ListOptions};
-use kubernetes::api::core::v1::{Pod,PodList,ContainerState};
-use kubernetes::api::meta::v1::EventType;
+use keel::client::{Client, KubernetesError, Observed, RequestOpts};
+
+type OptionResult<T> = Result<T, NoneError>;
+
+fn opt_or<T>(opt: OptionResult<T>, optb: T) -> T {
+    opt.unwrap_or(optb)
+}
+
+#[derive(Fail, Debug)]
+#[fail(display = "Parse error {}", reason)]
+struct ParseError {
+    reason: String,
+}
+
+fn pod_name(p: &Pod) -> &str {
+    opt_or(
+        try { p.metadata.as_ref()?.name.as_ref()?.as_str() },
+        "(no name)",
+    )
+}
 
 fn print_pod_state(p: &Pod) {
-    println!("pod {} - {:?}",
-             p.metadata.name.as_ref().map(String::as_str).unwrap_or("(no name)"),
-             p.status.phase.unwrap_or(api::core::v1::PodPhase::Unknown));
-    let c_statuses = p.status.init_container_statuses.iter()
-        .chain(p.status.container_statuses.iter());
-    for c in c_statuses {
+    let name = pod_name(p);
+    let status = opt_or(
+        try { p.status.as_ref()?.phase.as_ref()?.as_str() },
+        "Unknown",
+    );
+
+    println!("pod {} - {}", name, status);
+
+    let empty_vec = Vec::new();
+    let init_statuses = opt_or(
+        try { p.status.as_ref()?.init_container_statuses.as_ref()? },
+        &empty_vec,
+    );
+    let container_statuses = opt_or(
+        try { p.status.as_ref()?.container_statuses.as_ref()? },
+        &empty_vec,
+    );
+
+    for c in init_statuses.iter().chain(container_statuses.iter()) {
         print!("  -> {}: ", c.name);
-        match c.state {
-            None => println!("state unknown"),
-            Some(ContainerState::Waiting(ref s)) =>
-                println!("waiting: {}",
-                         s.message.as_ref()
-                         .or(s.reason.as_ref())
-                         .map(String::as_str)
-                         .unwrap_or("waiting")),
-            Some(ContainerState::Running(ref s)) => {
-                print!("running");
-                if let Some(ref t) = s.started_at {
-                    print!(" since {}", t);
+        if let Some(state) = &c.state {
+            if let Some(waiting) = &state.waiting {
+                println!(
+                    "waiting: {}",
+                    waiting
+                        .message
+                        .as_ref()
+                        .or_else(|| waiting.reason.as_ref())
+                        .map(String::as_str)
+                        .unwrap_or("waiting")
+                )
+            } else if let Some(running) = &state.running {
+                match running.started_at {
+                    Some(Time(t)) => println!("running since {}", t),
+                    None => println!("running"),
                 }
-                println!("");
-            },
-            Some(ContainerState::Terminated(ref s)) => {
-                if let Some(ref msg) = s.message {
-                    println!("terminated: {}", msg);
+            } else if let Some(s) = &state.terminated {
+                if let Some(msg) = &s.message {
+                    println!("terminated: {}", msg)
+                } else if let Some(Time(t)) = &s.finished_at {
+                    println!("exited with code {} at {}", s.exit_code, t)
                 } else {
-                    print!("exited with code {}", s.exit_code);
-                    if let Some(ref t) = s.finished_at {
-                        print!(" at {}", t);
-                    }
-                    println!("");
+                    println!("exited with code {}", s.exit_code)
                 }
-            },
-        }
+            } else {
+                println!("state unknown")
+            }
+        } else {
+            println!("state unknown")
+        };
     }
 }
 
-fn main_() -> Result<(),Error> {
+fn handle_pod_event(event: WatchEvent) -> Result<(), Error> {
+    match event.type_.to_ascii_lowercase().as_str() {
+        "added" | "modified" => {
+            let RawExtension(object) = event.object;
+            let p: Pod = serde_json::from_value(object)?;
+            print_pod_state(&p);
+        }
+        "deleted" => {
+            let RawExtension(object) = event.object;
+            let p: Pod = serde_json::from_value(object)?;
+            println!("deleted {}", pod_name(&p));
+        }
+        other => {
+            let RawExtension(object) = event.object;
+            match (try { object.get("metadata")?.get("resource_version")?.to_string() }) {
+                Ok(_version) => {
+                    info!("Ignoring {} event {:#?}", other, object);
+                }
+                Err(NoneError) => {
+                    let status_message: Result<String, Error> = try {
+                        let s: Status = serde_json::from_value(object)?;
+                        format!(
+                            "status {}-{}, reason: {}, message: {}",
+                            s.code.unwrap_or(-1),
+                            opt_or(try { s.status?.as_str() }, "(unknown)"),
+                            opt_or(try { s.reason?.as_str() }, "(unknown)"),
+                            opt_or(try { s.message?.as_str() }, "(unknown)")
+                        )
+                    };
+                    match status_message {
+                        Err(e) => {
+                            return Err((ParseError {
+                                reason: format!("Unable to parse response to watch: {}", e),
+                            }).into())
+                        }
+                        Ok(m) => {
+                            return Err(ParseError {
+                                reason: format!("Error from watch: {}", m),
+                            }.into())
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+struct Looper<S>
+where
+    S: Stream<Item = (), Error = ()>,
+{
+    stream: S,
+}
+
+impl<S> Future for Looper<S>
+where
+    S: Stream<Item = (), Error = ()>,
+{
+    type Error = ();
+    type Item = ();
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        while let Ok(Async::Ready(_)) = self.stream.poll() {
+            ()
+        }
+        Ok(Async::NotReady)
+    }
+}
+
+fn main_() -> Result<(), Error> {
     let client = Client::new()?;
 
-    let pods = api::core::v1::GROUP_VERSION.with_resource("pods");
-    let namespace = Some("kube-system");
+    let req_builder = Box::new(|opts: RequestOpts| {
+        Pod::list_core_v1_namespaced_pod(
+            "kube-system",
+            opts.continu_,
+            None,
+            None,
+            None,
+            None,
+            None,
+            opts.resource_version,
+            None,
+            Some(opts.watch),
+        )
+    });
 
-    let work = client.list(&pods, namespace, Default::default())
-        .inspect(|podlist: &PodList| {
-            podlist.items.iter().for_each(print_pod_state);
-        })
-        .and_then(move |podlist: PodList| {
-            debug!("Starting at resource version {}", podlist.metadata.resource_version);
-
-            let listopts = ListOptions { resource_version: podlist.metadata.resource_version, ..Default::default() };
-            client.watch_list(&pods, namespace, listopts)
-                .for_each(|event| {
-                    match event.typ {
-                        EventType::Added|EventType::Modified => {
-                            let p: Pod = serde_json::from_value(event.object)?;
-                            print_pod_state(&p);
-                        },
-                        EventType::Deleted => {
-                            let p: Pod = serde_json::from_value(event.object)?;
-                            println!("deleted {}",
-                                     p.metadata.name.unwrap_or("(no name)".into()));
-                        },
-                        EventType::Error => debug!("Ignoring error event {:#?}", event.object),
+    let stream = client
+        .observe::<PodList, WatchEvent, Status, Vec<u8>>(req_builder)?
+        .then(|result| -> Result<(), ()> {
+            match result {
+                Ok(Observed::List(l)) => {
+                    l.items.iter().for_each(|pod| print_pod_state(&pod));
+                }
+                Ok(Observed::ListPart(l)) => {
+                    l.items.iter().for_each(|pod| print_pod_state(&pod));
+                }
+                Ok(Observed::Item(event)) => {
+                    if let Err(e) = handle_pod_event(event) {
+                        println!("Error parsing pod event: {}", e);
                     }
-                    Ok(())
-                })
+                }
+                Err(KubernetesError::Status(s)) => {
+                    println!("Encountered error: {:#?}", s);
+                }
+                Err(KubernetesError::Other(e)) => {
+                    println!("Encountered error: {}", e);
+                }
+            }
+
+            Ok(())
         });
 
-    rt::run(work.map_err(|err| panic!("Error: {}", err)));
+    rt::run(Looper { stream });
 
     Ok(())
 }
@@ -98,12 +212,12 @@ fn main() {
         Ok(_) => 0,
         Err(e) => {
             eprintln!("Error: {}", e);
-            for c in e.causes().skip(1) {
+            for c in e.iter_chain().skip(1) {
                 eprintln!(" Caused by {}", c);
             }
-            debug!("Backtrace: {}", e.backtrace());
+            error!("Backtrace: {}", e.backtrace());
             1
-        },
+        }
     };
     ::std::process::exit(status);
 }

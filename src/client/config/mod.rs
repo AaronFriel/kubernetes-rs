@@ -1,12 +1,14 @@
-use std::path::{Path,PathBuf};
-use std::fs::File;
-use std::env::home_dir;
-use std::io::{self,Read};
-use failure::Error;
-use serde_yaml;
+pub mod api;
+
+use dirs::home_dir;
+use failure::{Error, Fail};
+use std::{
+    fs::File,
+    io::{self, Read},
+    path::{Path, PathBuf},
+};
 
 use self::api::Config;
-pub mod api;
 
 pub const CONFIG_ENV: &str = "KUBECONFIG";
 
@@ -16,12 +18,11 @@ pub struct ConfigError {
     msg: &'static str,
 }
 pub fn config_err(msg: &'static str) -> ConfigError {
-    ConfigError{msg: msg}
+    ConfigError { msg }
 }
 
 pub fn default_path() -> Option<PathBuf> {
-    home_dir()
-        .map(|h| h.join(".kube").join("config"))
+    home_dir().map(|h| h.join(".kube").join("config"))
 }
 
 pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, Error> {
@@ -38,11 +39,10 @@ pub struct ConfigContext {
 }
 
 fn data_or_file(data: &[u8], file: &Path) -> Option<io::Result<Vec<u8>>> {
-    let ret = if data.len() > 0 {
+    let ret = if !data.is_empty() {
         Ok(data.to_vec())
-    } else if file.as_os_str().len() > 0 {
-        File::open(file)
-            .and_then(|f| f.bytes().collect())
+    } else if !file.as_os_str().is_empty() {
+        File::open(file).and_then(|f| f.bytes().collect())
     } else {
         return None;
     };
@@ -51,40 +51,46 @@ fn data_or_file(data: &[u8], file: &Path) -> Option<io::Result<Vec<u8>>> {
 
 impl api::Cluster {
     pub fn certificate_authority_read(&self) -> Option<io::Result<Vec<u8>>> {
-        data_or_file(&self.certificate_authority_data,
-                     &self.certificate_authority)
+        data_or_file(
+            &self.certificate_authority_data,
+            &self.certificate_authority,
+        )
     }
 }
 
 impl api::AuthInfo {
     pub fn client_certificate_read(&self) -> Option<io::Result<Vec<u8>>> {
-        data_or_file(&self.client_certificate_data,
-                     &self.client_certificate)
+        data_or_file(&self.client_certificate_data, &self.client_certificate)
     }
 
     pub fn client_key_read(&self) -> Option<io::Result<Vec<u8>>> {
-        data_or_file(&self.client_key_data,
-                     &self.client_key)
+        data_or_file(&self.client_key_data, &self.client_key)
     }
 }
 
 impl api::Config {
     pub fn config_context(&self, name: &str) -> Result<ConfigContext, ConfigError> {
-        let ctx = self.contexts.iter()
+        let ctx = self
+            .contexts
+            .iter()
             .find(|e| e.name == name)
             .map(|e| &e.context)
-            .ok_or(config_err("context doesn't exist"))?;
-        let cluster = self.clusters.iter()
+            .ok_or_else(|| config_err("context doesn't exist"))?;
+        let cluster = self
+            .clusters
+            .iter()
             .find(|e| e.name == ctx.cluster)
             .map(|e| &e.cluster)
-            .ok_or(config_err("context cluster doesn't exist"))?;
-        let user = self.users.iter()
+            .ok_or_else(|| config_err("context cluster doesn't exist"))?;
+        let user = self
+            .users
+            .iter()
             .find(|e| e.name == ctx.user)
             .map(|e| &e.user)
-            .ok_or(config_err("context user doesn't exist"))?;
+            .ok_or_else(|| config_err("context user doesn't exist"))?;
         let default_namespace = &ctx.namespace;
 
-        Ok(ConfigContext{
+        Ok(ConfigContext {
             user: user.clone(),
             cluster: cluster.clone(),
             default_namespace: default_namespace.clone(),

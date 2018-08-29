@@ -1,0 +1,7 @@
+edition = "2018"
+reorder_imports = true
+reorder_modules = true
+merge_imports = true
+reorder_impl_items = true
+tab_spaces = 4
+use_field_init_shorthand = true
