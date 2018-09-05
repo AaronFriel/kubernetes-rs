@@ -1,3 +1,8 @@
+# A work in progress
+
+This project may be forked from the [`kubernetes`](https://crates.io/crates/kubernetes) or it may
+not.
+
 # A Kubernetes API client library for Rust
 
 [crates.io]: https://crates.io/crates/kubernetes
